@@ -1,0 +1,789 @@
+"""
+OCR 文字识别工具 —— 主程序
+==========================
+
+功能概述：
+  1. 左侧面板：监视系统剪贴板，当检测到新的截图时自动运行 OCR 识别，
+     并将文字结果显示在界面上。
+  2. 右侧面板：手动选择本地图片文件，点击按钮触发 OCR 识别。
+  3. 公共功能：识别文字后，可复制到剪贴板或进行英中互译。
+  4. 翻译功能通过 Ollama 本地大模型实现，支持"英→中"和"中→英"两个方向。
+  5. 点击缩略图可弹出一个支持滚轮缩放和拖拽平移的图片查看器。
+
+技术架构：
+  - GUI 框架：PyQt5（QMainWindow + 自定义 QGraphicsView）
+  - OCR 引擎：PaddleOCR（PP-OCRv5 服务端模型）
+  - 翻译引擎：Ollama（通过 trans.py 模块调用本地大模型）
+  - 异步翻译：QThread 工作线程（防止 UI 卡顿）
+  - 剪贴板监听：QTimer 定时轮询（每 500ms 检查一次截图）
+
+使用前准备：
+  1. 确保 ../models/ 目录下已放置 PP-OCRv5 模型文件
+  2. 确保 Ollama 服务已启动，且已拉取 qwen2.5:7b-instruct-q4_K_M 模型
+  3. pip install paddleocr pyqt5 pillow ollama numpy
+"""
+
+import sys                            # 系统退出、命令行参数
+import hashlib                        # MD5 哈希，用于判断剪贴板图片是否变化
+import numpy as np                    # 将 PIL Image 转为 numpy 数组供 OCR 使用
+from PIL import ImageGrab, Image      # ImageGrab: 从剪贴板获取截图; Image: 图片加载与处理
+
+# ---------- PaddleOCR ----------
+from paddleocr import PaddleOCR       # 文字检测 + 识别引擎
+
+# ---------- PyQt5 GUI 组件 ----------
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow,        # 应用入口 & 主窗口
+    QTextEdit,                        # 多行文本显示（只读，用于显示识别/翻译结果）
+    QVBoxLayout, QHBoxLayout,         # 垂直 & 水平布局管理器
+    QWidget,                          # 基础控件
+    QLabel,                           # 标签（用于显示缩略图）
+    QPushButton,                      # 按钮
+    QFileDialog,                      # 文件选择对话框
+    QGroupBox,                        # 分组框（将左侧/右侧面板各自分组）
+    QMessageBox,                      # 消息弹窗（错误提示）
+    QGraphicsView, QGraphicsScene,    # 图形视图框架（用于可缩放的图片查看器）
+    QGraphicsPixmapItem,              # 图形视图中的像素图项
+    QComboBox,                        # 下拉选择框（翻译方向选择）
+)
+from PyQt5.QtGui import (
+    QPixmap,                          # 像素图（用于在 QLabel 中显示）
+    QClipboard,                       # 系统剪贴板（实际不使用，QApplication.clipboard() 替代）
+    QImage,                           # Qt 图像格式（PIL Image 与 QPixmap 之间的桥梁）
+    QPainter,                         # 绘图引擎（开启抗锯齿渲染）
+)
+from PyQt5.QtCore import (
+    QTimer,                           # 定时器（轮询剪贴板）
+    pyqtSignal,                       # 自定义信号（Qt 信号/槽机制的核心）
+    QObject,                          # Qt 对象基类
+    Qt,                               # Qt 命名空间（对齐方式、键盘按键等常量）
+    QEvent,                           # 事件类型
+    QThread,                          # 工作线程（翻译任务放到子线程执行）
+)
+
+# ---------- 自定义翻译模块 ----------
+import trans                         # 封装了 Ollama 翻译调用逻辑
+
+
+# ============================================================================
+# 一、OCR 引擎初始化（全局单例，程序启动时加载一次）
+# ============================================================================
+print("正在加载 OCR 模型，请稍候...")
+ocr = PaddleOCR(
+    use_textline_orientation=True,                                    # 是否启用文字方向检测（横排/竖排）
+    lang='ch',                                                        # 语言：中文（支持中英混合）
+    text_detection_model_dir='../models/PP-OCRv5_server_det_infer',  # 文字检测模型路径
+    text_recognition_model_dir='../models/PP-OCRv5_server_rec_infer',# 文字识别模型路径
+    textline_orientation_model_dir='../models/PP-LCNet_x1_0_textline_ori_infer',  # 文字方向分类模型路径
+)
+print("模型就绪！")
+
+
+# ============================================================================
+# 二、翻译工作线程 —— 继承 QThread
+# ============================================================================
+# 为什么需要多线程？
+#   翻译操作通过 Ollama 调用本地大模型，耗时可能较长（几秒到十几秒）。
+#   如果直接在主线程（UI 线程）中执行，会导致界面卡死、无法响应。
+#   将耗时任务放到子线程，主线程可以继续处理用户交互。
+class TranslationWorker(QThread):
+    """
+    翻译工作线程，负责在后台执行 Ollama 翻译请求。
+
+    信号：
+        finished(str)  —— 翻译成功时发射，携带译文文本
+        error(str)     —— 翻译失败时发射，携带错误信息
+
+    用法示例：
+        worker = TranslationWorker(translator, text, direction)
+        worker.finished.connect(on_done)
+        worker.error.connect(on_error)
+        worker.start()  # 启动线程，内部自动调用 run()
+    """
+    finished = pyqtSignal(str)   # 翻译完成信号
+    error = pyqtSignal(str)      # 翻译出错信号
+
+    def __init__(self, translator, text, direction):
+        """
+        参数：
+            translator : trans.Translator  —— 已初始化的翻译器实例
+            text       : str              —— 待翻译的文本
+            direction  : str              —— 翻译方向，'en-zh' 或 'zh-en'
+        """
+        super().__init__()
+        self.translator = translator
+        self.text = text
+        self.direction = direction
+
+    def run(self):
+        """
+        线程入口方法（由 QThread.start() 内部调用）。
+        必须重写此方法，将耗时逻辑放在这里。
+        注意：不要在 run() 中直接操作 GUI 组件，否则会崩溃。
+              应通过 emit 信号将结果传回主线程处理。
+        """
+        try:
+            result = self.translator.translate(self.text, self.direction)
+            self.finished.emit(result)       # 成功 → 发射 finished 信号
+        except Exception as e:
+            self.error.emit(str(e))          # 失败 → 发射 error 信号
+
+
+# ============================================================================
+# 三、可缩放图片查看器 —— 继承 QGraphicsView
+# ============================================================================
+class ImageViewer(QGraphicsView):
+    """
+    图片查看器窗口。
+
+    功能：
+      - 鼠标滚轮缩放（以鼠标位置为锚点）
+      - 鼠标拖拽平移（ScrollHandDrag 模式）
+      - Esc 键关闭窗口
+      - 点击查看器外部任意位置自动关闭
+      - 右上角红色 ✕ 按钮关闭
+      - 窗口置顶（防止被主窗口遮挡）
+
+    继承关系：
+      QGraphicsView
+        └── QGraphicsScene（场景，管理所有图形项）
+              └── QGraphicsPixmapItem（像素图项，显示图片）
+    """
+    def __init__(self, pil_image: Image.Image, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("查看原图（滚轮缩放/拖拽/Esc/点击外部关闭）")
+
+        # 窗口标志位：保持置顶 + 保留原有标志位
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+
+        # 开启抗锯齿渲染（缩放时图片边缘更平滑）
+        self.setRenderHint(QPainter.Antialiasing)
+
+        # 拖拽模式：手型拖拽（按住左键平移画面）
+        self.setDragMode(QGraphicsView.ScrollHandDrag)
+
+        # ---------- 创建场景与图片项 ----------
+        self.scene = QGraphicsScene(self)
+        self.setScene(self.scene)
+        self.pixmap_item = QGraphicsPixmapItem()
+        self.scene.addItem(self.pixmap_item)
+
+        # 将 PIL Image 设置到显示项中
+        self.set_image(pil_image)
+
+        # fitInView: 自动调整缩放比例，使图片完整显示在视图内（保持宽高比）
+        self.fitInView(self.pixmap_item, Qt.KeepAspectRatio)
+
+        # 设置缩放锚点：以鼠标所在位置为缩放中心（而不是视图中心）
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
+
+        # ---------- 右上角关闭按钮 ----------
+        self.close_btn = QPushButton("✕", self)
+        self.close_btn.setFixedSize(32, 32)
+        self.close_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #e74c3c; color: white;
+                font-weight: bold; font-size: 16px;
+                border-radius: 16px; border: none;
+            }
+            QPushButton:hover { background-color: #c0392b; }
+        """)
+        self.close_btn.clicked.connect(self.close)
+        self.close_btn.raise_()  # 将按钮提升到最上层（不被图片遮挡）
+
+        # ---------- 安装全局事件过滤器 ----------
+        # 目的：监听整个应用程序的鼠标点击事件。
+        # 当用户点击查看器之外的区域时，自动关闭查看器。
+        QApplication.instance().installEventFilter(self)
+
+    # ---- 图片设置 ----
+    def set_image(self, pil_image: Image.Image):
+        """
+        将 PIL Image 对象设置到视图的图片项中显示。
+
+        转换流程：
+          PIL Image → _pil_to_qimage() → QImage → QPixmap → pixmap_item.setPixmap()
+        """
+        qimage = self._pil_to_qimage(pil_image)
+        pixmap = QPixmap.fromImage(qimage)
+        self.pixmap_item.setPixmap(pixmap)
+
+    def _pil_to_qimage(self, pil_image: Image.Image) -> QImage:
+        """
+        PIL Image → QImage 转换工具。
+
+        注意：
+          - 如果图片为 RGBA 模式（带透明通道），先转为 RGB，否则可能显示异常。
+          - 使用 tobytes("raw", "RGB") 获取原始字节数据。
+          - 用 .copy() 返回副本：因为 QImage 构造函数只引用传入数据，
+            不复制，.copy() 确保数据生命周期安全。
+        """
+        if pil_image.mode == "RGBA":
+            pil_image = pil_image.convert("RGB")
+        img_data = pil_image.tobytes("raw", "RGB")
+        qimage = QImage(img_data, pil_image.width, pil_image.height,
+                        pil_image.width * 3,  # 每行字节数（RGB 3 通道）
+                        QImage.Format_RGB888)
+        return qimage.copy()
+
+    # ============ 交互事件处理 ============
+
+    def wheelEvent(self, event):
+        """
+        鼠标滚轮事件：按比例缩放视图。
+
+        缩放策略：
+          - 向上滚动（远离用户）→ 放大（×1.2）
+          - 向下滚动（靠近用户）→ 缩小（÷1.2）
+          - 锚点为鼠标位置（已在 __init__ 中设置）
+        """
+        factor = 1.2
+        if event.angleDelta().y() < 0:
+            factor = 1.0 / factor
+        self.scale(factor, factor)
+
+    def keyPressEvent(self, event):
+        """
+        键盘按键事件：按 Esc 键关闭查看器。
+        """
+        if event.key() == Qt.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(event)
+
+    def resizeEvent(self, event):
+        """
+        窗口尺寸变化事件：确保右上角的关闭按钮始终跟随到新位置。
+        按钮位置：距右边距 12px，距顶部 12px。
+        """
+        super().resizeEvent(event)
+        btn_size = self.close_btn.width()
+        self.close_btn.move(self.width() - btn_size - 12, 12)
+
+    # ============ 点击外部自动关闭 ============
+    def eventFilter(self, obj, event):
+        """
+        全局事件过滤器。
+
+        原理：
+          安装到 QApplication 后，整个程序的所有事件都会经过此方法。
+          当检测到任意鼠标按下事件时，判断点击目标是否在本查看器内部：
+            - 如果不在内部 → 关闭查看器
+            - 如果在内部 → 忽略，让事件正常传递
+
+        判断方法：
+          QApplication.widgetAt(event.globalPos()) 获取全局坐标下的控件。
+          isAncestorOf() 判断该控件是否为查看器的子控件。
+        """
+        if event.type() == QEvent.MouseButtonPress:
+            # 获取鼠标按下位置对应的控件（基于全局坐标）
+            clicked_widget = QApplication.widgetAt(event.globalPos())
+            # 如果点击的控件不是本查看器，也不是本查看器的后代控件
+            if clicked_widget is not self and not self.isAncestorOf(clicked_widget):
+                self.close()
+                return True
+        return super().eventFilter(obj, event)
+
+    def closeEvent(self, event):
+        """
+        窗口关闭事件：移除全局事件过滤器，避免内存泄漏。
+        否则 QApplication 会持续持有对本对象的引用。
+        """
+        QApplication.instance().removeEventFilter(self)
+        super().closeEvent(event)
+
+
+# ============================================================================
+# 四、主窗口 —— 继承 QMainWindow
+# ============================================================================
+class MainWindow(QMainWindow):
+    """
+    应用程序主窗口。
+
+    布局结构（从上到下）：
+      ┌─────────────────────────────────────────────────┐
+      │  [翻译方向: 英→中 ▾]          ← 顶部翻译方向栏  │
+      ├──────────────────────┬──────────────────────────┤
+      │  左侧：截屏识别      │  右侧：选图识别          │
+      │  ┌────────────────┐  │  ┌────────────────────┐  │
+      │  │  缩略图预览    │  │  │  缩略图预览        │  │
+      │  └────────────────┘  │  └────────────────────┘  │
+      │  ┌────────────────┐  │  [选择图片] [开始识别]   │
+      │  │  识别文字区域  │  │  ┌────────────────────┐  │
+      │  │                │  │  │  识别文字区域      │  │
+      │  └────────────────┘  │  └────────────────────┘  │
+      │  [复制文字] [翻译]   │  [复制文字] [翻译]       │
+      └──────────────────────┴──────────────────────────┘
+
+    信号/槽连接关系：
+      外部 ClipboardWatcher.new_result  →  update_clipboard_result()
+      翻译线程 TranslationWorker.finished  →  _on_translation_done()
+      翻译线程 TranslationWorker.error     →  _on_translation_error()
+    """
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("OCR 文字识别工具")
+        self.setGeometry(100, 100, 1000, 650)  # 窗口位置(x,y) 和 尺寸(宽,高)
+
+        # ---------- 中心控件 ----------
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout()  # 主布局：垂直方向
+        central.setLayout(main_layout)
+
+        # ---------- 顶部：翻译方向选择栏 ----------
+        direction_layout = QHBoxLayout()
+        direction_layout.addStretch()                     # 弹性空间（将控件推到右边）
+        direction_layout.addWidget(QLabel("翻译方向:"))
+        self.trans_direction = QComboBox()
+        self.trans_direction.addItems(["英→中", "中→英"])
+        self.trans_direction.setCurrentIndex(0)           # 默认选中第 0 项（英→中）
+        direction_layout.addWidget(self.trans_direction)
+        main_layout.addLayout(direction_layout)
+
+        # ---------- 中部：左右分栏 ----------
+        splitter_layout = QHBoxLayout()
+        self.clipboard_group = self._create_clipboard_section()  # 左侧面板
+        splitter_layout.addWidget(self.clipboard_group)
+        self.file_group = self._create_file_section()            # 右侧面板
+        splitter_layout.addWidget(self.file_group)
+
+        # 设置拉伸比例：左右 1:1 平分宽度
+        splitter_layout.setStretch(0, 1)
+        splitter_layout.setStretch(1, 1)
+        main_layout.addLayout(splitter_layout)
+
+        # ---------- 初始化翻译器 ----------
+        self.translator = trans.Translator()
+
+    # ---- 构建左侧面板：截屏文字识别 ----
+    def _create_clipboard_section(self) -> QGroupBox:
+        """
+        创建左侧"截屏文字识别"面板。
+
+        组件组成：
+          QLabel（缩略图） + QTextEdit（文字） + 两个按钮（复制/翻译）
+
+        关键设计：
+          clip_img_label.mousePressEvent 被重新绑定到 _enlarge_clip_image，
+          实现点击缩略图弹出图片查看器的功能。
+        """
+        group = QGroupBox("截屏文字识别结果")
+        layout = QVBoxLayout(group)
+
+        # 缩略图标签
+        self.clip_img_label = QLabel("等待截屏...")
+        self.clip_img_label.setAlignment(Qt.AlignCenter)
+        self.clip_img_label.setMinimumHeight(150)
+        self.clip_img_label.setStyleSheet(
+            "border: 1px solid #ccc; background-color: #f5f5f5;"
+        )
+        # 将鼠标点击事件重定向到放大查看方法
+        self.clip_img_label.mousePressEvent = self._enlarge_clip_image
+        layout.addWidget(self.clip_img_label)
+
+        # 文字显示区域（只读）
+        self.clip_text_edit = QTextEdit()
+        self.clip_text_edit.setReadOnly(True)
+        self.clip_text_edit.setPlaceholderText("识别文字将显示在这里...")
+        layout.addWidget(self.clip_text_edit)
+
+        # 底部按钮行
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        self.clip_copy_btn = QPushButton("复制文字")
+        self.clip_copy_btn.clicked.connect(self._copy_clip_text)
+        btn_layout.addWidget(self.clip_copy_btn)
+
+        self.clip_translate_btn = QPushButton("翻译")
+        self.clip_translate_btn.clicked.connect(self._translate_clip_text)
+        btn_layout.addWidget(self.clip_translate_btn)
+
+        layout.addLayout(btn_layout)
+        return group
+
+    # ---- 构建右侧面板：选择图片进行文字识别 ----
+    def _create_file_section(self) -> QGroupBox:
+        """
+        创建右侧"选择图片进行文字识别"面板。
+
+        组件组成：
+          [选择图片] [开始识别] + QLabel（缩略图） + QTextEdit（文字） + [复制文字] [翻译]
+
+        关键状态：
+          self.selected_file_path —— 当前选中的图片路径（None 表示未选择）
+          self.recognize_btn.setEnabled(False) —— 初始禁用"开始识别"按钮，
+            直到用户选择了有效图片后才启用。
+        """
+        group = QGroupBox("选择图片进行文字识别")
+        layout = QVBoxLayout(group)
+
+        # 顶部操作按钮行
+        top_btn_layout = QHBoxLayout()
+        self.select_btn = QPushButton("选择图片")
+        self.select_btn.clicked.connect(self._select_image)
+        top_btn_layout.addWidget(self.select_btn)
+
+        self.recognize_btn = QPushButton("开始识别")
+        self.recognize_btn.clicked.connect(self._recognize_selected_image)
+        self.recognize_btn.setEnabled(False)  # 初始禁用
+        top_btn_layout.addWidget(self.recognize_btn)
+
+        top_btn_layout.addStretch()
+        layout.addLayout(top_btn_layout)
+
+        # 缩略图标签
+        self.file_img_label = QLabel("未选择图片")
+        self.file_img_label.setAlignment(Qt.AlignCenter)
+        self.file_img_label.setMinimumHeight(150)
+        self.file_img_label.setStyleSheet(
+            "border: 1px solid #ccc; background-color: #f5f5f5;"
+        )
+        self.file_img_label.mousePressEvent = self._enlarge_file_image
+        layout.addWidget(self.file_img_label)
+
+        # 文字显示区域（只读）
+        self.file_text_edit = QTextEdit()
+        self.file_text_edit.setReadOnly(True)
+        self.file_text_edit.setPlaceholderText("识别文字将显示在这里...")
+        layout.addWidget(self.file_text_edit)
+
+        # 底部按钮行
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        self.file_copy_btn = QPushButton("复制文字")
+        self.file_copy_btn.clicked.connect(self._copy_file_text)
+        btn_layout.addWidget(self.file_copy_btn)
+
+        self.file_translate_btn = QPushButton("翻译")
+        self.file_translate_btn.clicked.connect(self._translate_file_text)
+        btn_layout.addWidget(self.file_translate_btn)
+
+        layout.addLayout(btn_layout)
+
+        self.selected_file_path = None  # 当前选中图片的路径
+        return group
+
+    # ============ 左侧剪贴板更新（由 ClipboardWatcher 信号触发） ============
+    def update_clipboard_result(self, text: str, pil_image: Image.Image):
+        """
+        接收来自 ClipboardWatcher 的新识别结果，更新左侧面板。
+
+        参数：
+          text      : str          —— OCR 识别出的文字
+          pil_image : Image.Image  —— 截图的 PIL Image 对象（用于缩略图显示）
+
+        数据流：
+          ClipboardWatcher.new_result.emit(text, img)
+            → update_clipboard_result(text, img)
+              → 更新缩略图 + 更新文字 + 保存完整图片引用（供放大查看用）
+        """
+        # 生成缩略图并显示
+        pixmap = self._pil_to_pixmap(pil_image, max_width=250, max_height=150)
+        self.clip_img_label.setPixmap(pixmap)
+
+        # 在 QLabel 上存储完整图片引用，供点击放大时使用
+        self.clip_img_label.setProperty("full_image", pil_image)
+        self.clip_text_edit.setPlainText(text)
+
+        # (临时功能)将识别文字追加写入 题目.txt
+        with open('题目.txt', 'a', encoding='utf-8') as f:
+            f.write(text)
+
+    # ============ 右侧选图方法 ============
+    def _select_image(self):
+        """
+        打开文件选择对话框，选择一张图片。
+
+        流程：
+          1. 弹出文件选择器，过滤常见图片格式（png/jpg/jpeg/bmp/gif）
+          2. 加载选中的图片为 PIL Image
+          3. 生成缩略图并显示在预览区
+          4. 存储完整图片引用
+          5. 启用"开始识别"按钮
+        """
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择图片", "",
+            "图片文件 (*.png *.jpg *.jpeg *.bmp *.gif)"
+        )
+        if path:
+            self.selected_file_path = path
+            try:
+                img = Image.open(path)
+                pixmap = self._pil_to_pixmap(img, max_width=250, max_height=150)
+                self.file_img_label.setPixmap(pixmap)
+                self.file_img_label.setProperty("full_image", img)
+                self.recognize_btn.setEnabled(True)
+                self.file_text_edit.clear()
+            except Exception as e:
+                QMessageBox.warning(self, "错误", f"无法打开图片：{e}")
+
+    def _recognize_selected_image(self):
+        """
+        对当前选中的图片执行 OCR 识别。
+
+        OCR 执行流程：
+          1. 用 PIL 打开图片 → 转为 numpy 数组
+          2. 调用 ocr.predict() 进行检测 + 识别
+          3. 遍历结果的 rec_texts 字段提取每行文字
+          4. 用换行符拼接所有文字行，显示在右侧文本框
+
+        PaddleOCR predict() 返回值结构：
+          list[dict] —— 每个元素是一个检测到的文本区域
+            dict['rec_texts']: list[str] —— 识别出的文字列表
+            例如：results = [{'rec_texts': ['Hello World', '你好世界']}, ...]
+        """
+        if not self.selected_file_path:
+            return
+        try:
+            img = Image.open(self.selected_file_path)
+            img_arr = np.array(img)          # PIL → numpy（PaddleOCR 的输入格式）
+            results = ocr.predict(img_arr)   # 执行检测 + 识别
+
+            # 收集所有识别到的文本行
+            lines = []
+            for res in results:
+                for t in res['rec_texts']:
+                    lines.append(t)
+
+            full_text = "\n".join(lines) if lines else "未识别到文字"
+            self.file_text_edit.setPlainText(full_text)
+        except Exception as e:
+            self.file_text_edit.setPlainText(f"识别失败：{e}")
+
+    # ============ 复制方法 ============
+    def _copy_clip_text(self):
+        """将左侧（截屏识别）文本框中的文字复制到系统剪贴板。"""
+        text = self.clip_text_edit.toPlainText()
+        QApplication.clipboard().setText(text)
+
+    def _copy_file_text(self):
+        """将右侧（选图识别）文本框中的文字复制到系统剪贴板。"""
+        text = self.file_text_edit.toPlainText()
+        QApplication.clipboard().setText(text)
+
+    # ============ 图片放大：弹出自定义 ImageViewer ============
+    def _enlarge_clip_image(self, event):
+        """点击左侧缩略图时，弹出图片查看器（需要先有截图识别结果）。"""
+        img = self.clip_img_label.property("full_image")
+        if img:
+            self._show_image_viewer(img)
+
+    def _enlarge_file_image(self, event):
+        """点击右侧缩略图时，弹出图片查看器（需要先选择了图片）。"""
+        img = self.file_img_label.property("full_image")
+        if img:
+            self._show_image_viewer(img)
+
+    def _show_image_viewer(self, pil_image: Image.Image):
+        """
+        创建并显示 ImageViewer 窗口。
+        初始尺寸 800×600，可根据需要拖拽调整。
+        """
+        viewer = ImageViewer(pil_image, parent=self)
+        viewer.resize(800, 600)
+        viewer.show()
+
+    # ============ 工具方法 ============
+    def _pil_to_pixmap(self, pil_image: Image.Image,
+                       max_width=250, max_height=150) -> QPixmap:
+        """
+        将 PIL Image 转为 QPixmap（缩略图），用于在 QLabel 中预览。
+
+        参数：
+          pil_image  : PIL Image  —— 原始图片
+          max_width  : int        —— 缩略图最大宽度（默认 250px）
+          max_height : int        —— 缩略图最大高度（默认 150px）
+
+        实现细节：
+          1. thumbnail() 方法会原地缩放图片，保持宽高比，
+             确保不超过 max_width × max_height。
+          2. 使用 Image.LANCZOS 重采样算法（高质量缩放）。
+          3. 如果图片不是 RGB 模式，先转换为 RGB。
+          4. 通过字节数据构造 QImage，再转为 QPixmap。
+        """
+        img = pil_image.copy()  # 复制一份，避免修改原图
+        img.thumbnail((max_width, max_height), Image.LANCZOS)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        qimage = QImage(img.tobytes(), img.width, img.height,
+                        img.width * 3,  # bytesPerLine: RGB 每行 3 字节
+                        QImage.Format_RGB888)
+        return QPixmap.fromImage(qimage)
+
+    # ============ 翻译方法（使用 QThread 异步执行） ============
+    def _translate_clip_text(self):
+        """
+        触发左侧（截屏区域）文字的翻译。
+
+        工作流程：
+          1. 获取文本框中的文字
+          2. 根据下拉框确定翻译方向（en-zh 或 zh-en）
+          3. 禁用翻译按钮（防止重复点击）
+          4. 创建 TranslationWorker 子线程
+          5. 连接 finished / error 信号到回调方法
+          6. 启动线程（worker.start() → 内部调用 run()）
+
+        注意：使用 lambda 闭包捕获当前按钮引用 btn，
+              确保翻译完成后能正确恢复对应按钮的可用状态。
+        """
+        text = self.clip_text_edit.toPlainText().strip()
+        if not text:
+            return
+        direction = "en-zh" if self.trans_direction.currentIndex() == 0 else "zh-en"
+        btn = self.sender()  # 获取被点击的按钮（信号发送者）
+        btn.setEnabled(False)
+        self.worker = TranslationWorker(self.translator, text, direction)
+        self.worker.finished.connect(
+            lambda res, b=btn: self._on_translation_done(res, "clip", b)
+        )
+        self.worker.error.connect(
+            lambda err, b=btn: self._on_translation_error(err, b)
+        )
+        self.worker.start()
+
+    def _translate_file_text(self):
+        """
+        触发右侧（选图区域）文字的翻译。
+        逻辑与 _translate_clip_text 完全对称。
+        """
+        text = self.file_text_edit.toPlainText().strip()
+        if not text:
+            return
+        btn = self.sender()
+        btn.setEnabled(False)
+        direction = "en-zh" if self.trans_direction.currentIndex() == 0 else "zh-en"
+        self.worker = TranslationWorker(self.translator, text, direction)
+        self.worker.finished.connect(
+            lambda res, b=btn: self._on_translation_done(res, "file", b)
+        )
+        self.worker.error.connect(
+            lambda err, b=btn: self._on_translation_error(err, b)
+        )
+        self.worker.start()
+
+    def _on_translation_done(self, result, section, btn):
+        """
+        翻译完成的回调（在主线程中执行）。
+
+        参数：
+          result  : str  —— 翻译结果文本
+          section : str  —— "clip"（左侧）或 "file"（右侧）
+          btn     : QPushButton —— 对应的翻译按钮（用于恢复可用状态）
+
+        结果展示方式：在对应文本框末尾追加 "--- 译文 ---" 分隔线和译文。
+        """
+        if section == "clip":
+            self.clip_text_edit.append("\n--- 译文 ---\n" + result)
+        else:
+            self.file_text_edit.append("\n--- 译文 ---\n" + result)
+        btn.setEnabled(True)  # 恢复按钮
+
+    def _on_translation_error(self, error_msg, btn):
+        """
+        翻译失败的回调（在主线程中执行）。
+        弹出错误提示对话框，并恢复翻译按钮。
+        """
+        QMessageBox.warning(self, "翻译失败",
+                            f"翻译过程中出现错误：\n{error_msg}")
+        btn.setEnabled(True)
+
+
+# ============================================================================
+# 五、剪贴板监视器 —— 继承 QObject
+# ============================================================================
+class ClipboardWatcher(QObject):
+    """
+    剪贴板监视器，定时检查剪贴板中是否有新的截图。
+
+    工作原理：
+      1. 使用 QTimer 每隔 500ms 触发一次 check_clipboard()
+      2. 调用 ImageGrab.grabclipboard() 尝试读取剪贴板图片
+      3. 如果没有图片 → 跳过
+      4. 如果有图片 → 计算 MD5 哈希值
+         - 与上次哈希相同 → 跳过（避免重复识别同一张图）
+         - 与上次哈希不同 → 更新哈希，执行 OCR，发射 new_result 信号
+
+    信号：
+      new_result(str, Image.Image)  —— 检测到新截图时发射
+        参数1: 识别出的文字
+        参数2: 原始截图（用于缩略图显示）
+
+    为什么用轮询而不是剪贴板变更事件？
+      PyQt5 的 QClipboard.dataChanged 信号在某些平台上不稳定 / 不可用。
+      QTimer 轮询是简单可靠的跨平台方案。
+    """
+    new_result = pyqtSignal(str, Image.Image)
+
+    def __init__(self):
+        super().__init__()
+        self.last_hash = None  # 上一次处理过的图片 MD5 值
+
+        # 创建定时器，每 500ms 触发一次检查
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.check_clipboard)
+        self.timer.start(500)
+
+    def check_clipboard(self):
+        """
+        定时器回调：检查剪贴板并识别新截图。
+
+        步骤：
+          1. 尝试从剪贴板获取图片
+          2. 无图片 → 直接返回
+          3. 计算 MD5 → 与上次比较 → 相同则跳过
+          4. 不同则执行 OCR 识别
+          5. 发射 new_result 信号，携带识别文字和原始图片
+        """
+        try:
+            img = ImageGrab.grabclipboard()
+        except Exception as e:
+            print(f"获取剪贴板图片失败: {e}")
+            return
+
+        if img is None:
+            return  # 剪贴板中没有图片
+
+        # MD5 去重：避免每 500ms 对同一张图重复识别
+        current_hash = hashlib.md5(img.tobytes()).hexdigest()
+        if current_hash == self.last_hash:
+            return
+        self.last_hash = current_hash
+
+        print("检测到新截图，识别中...")
+        img_arr = np.array(img)
+        try:
+            results = ocr.predict(img_arr)
+            lines = []
+            for res in results:
+                for t in res['rec_texts']:
+                    lines.append(t)
+            full_text = "\n".join(lines) if lines else "未识别到文字"
+            self.new_result.emit(full_text, img)  # 发射信号通知主窗口
+
+        except Exception as e:
+            print(f"OCR 出错: {e}")
+
+
+# ============================================================================
+# 六、程序入口
+# ============================================================================
+if __name__ == "__main__":
+    # 创建 Qt 应用实例（sys.argv 允许命令行传参给 Qt）
+    app = QApplication(sys.argv)
+
+    # 创建并显示主窗口
+    window = MainWindow()
+    window.show()
+
+    # 创建剪贴板监视器，并将其 new_result 信号连接到主窗口的处理槽
+    watcher = ClipboardWatcher()
+    watcher.new_result.connect(window.update_clipboard_result)
+
+    print("程序已启动。关闭主窗口即可退出。")
+
+    # 进入 Qt 事件循环（阻塞，直到程序退出）
+    app.exec_()
