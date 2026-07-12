@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ProjectModuleManager">
+    <modules>
+      <module fileurl="file://$PROJECT_DIR$/../../PythonProject/Expression/.idea/Expression.iml" filepath="$PROJECT_DIR$/../../PythonProject/Expression/.idea/Expression.iml" />
+      <module fileurl="file://$PROJECT_DIR$/../../PythonProject/SpeechBrain/.idea/SpeechBrain.iml" filepath="$PROJECT_DIR$/../../PythonProject/SpeechBrain/.idea/SpeechBrain.iml" />
+      <module fileurl="file://$PROJECT_DIR$/../../PythonProject/Test/.idea/Test.iml" filepath="$PROJECT_DIR$/../../PythonProject/Test/.idea/Test.iml" />
+      <module fileurl="file://$PROJECT_DIR$/../../PythonProject/Whisper/.idea/Whisper.iml" filepath="$PROJECT_DIR$/../../PythonProject/Whisper/.idea/Whisper.iml" />
+      <module fileurl="file://$PROJECT_DIR$/../.idea/clone_project.iml" filepath="$PROJECT_DIR$/../.idea/clone_project.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/textcnn.iml" filepath="$PROJECT_DIR$/.idea/textcnn.iml" />
+      <module fileurl="file://$PROJECT_DIR$/../../PythonProject/图像处理/.idea/图像处理.iml" filepath="$PROJECT_DIR$/../../PythonProject/图像处理/.idea/图像处理.iml" />
+    </modules>
+  </component>
+</project>
