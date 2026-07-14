@@ -2,6 +2,9 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
+      <module fileurl="file://$PROJECT_DIR$/../音频识别/.idea/SpeechBrain.iml" filepath="$PROJECT_DIR$/../音频识别/.idea/SpeechBrain.iml" />
+      <module fileurl="file://$PROJECT_DIR$/../词级分割/.idea/Whisper.iml" filepath="$PROJECT_DIR$/../词级分割/.idea/Whisper.iml" />
+      <module fileurl="file://$PROJECT_DIR$/../文字识别/.idea/textcnn.iml" filepath="$PROJECT_DIR$/../文字识别/.idea/textcnn.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/图像处理.iml" filepath="$PROJECT_DIR$/.idea/图像处理.iml" />
     </modules>
   </component>
